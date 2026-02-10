@@ -1,0 +1,125 @@
+name: zte_e8820s or xiaomi_redmi-router-ac2100 
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: '选择设备'
+        required: true
+        default: 'zte_e8820s'
+        type: choice
+        options:
+          - 'zte_e8820s'
+          - 'xiaomi_redmi-router-ac2100'
+jobs:
+
+  build_openwrt:
+
+    name: Build OpenWrt firmware
+
+    runs-on: ubuntu-latest
+
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@main
+        
+      # === 缓存 dl, feeds 和 ccache ===
+      - name: Cache Dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ./dl
+            ./feeds
+            ./.ccache
+          key: ${{ runner.os }}-openwrt-${{ inputs.model }}-${{ hashFiles('**/feeds.conf.default', '**/Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-${{ inputs.model }}-
+            ${{ runner.os }}-openwrt-
+  
+      - name: Space cleanup and Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi `docker images -q`
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
+          sudo -E apt update
+          sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* moby* snap*
+          sudo -E apt -y full-upgrade
+          sudo -E apt -y install ack antlr3 aria2 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt -y autoremove --purge
+          sudo -E apt clean
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+      - name: Update feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate configuration file
+        run: |
+          rm -f ./.config*
+          touch ./.config
+
+          cat >> .config <<EOF
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_${{ inputs.model }}=y
+          # === 优化 开启 Ccache 加速编译 ===
+          CONFIG_CCACHE=y          
+          EOF
+
+          sed -i 's/^[ \t]*//g' ./.config
+          make defconfig
+
+      - name: Make download
+        run: |
+          make download -j16 || make download -j1 V=s
+          rm -rf $(find ./dl/ -size -1024c)
+          df -h
+
+      - name: Compile firmware
+        run: |
+          # 使用 ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          make -j$(nproc) || make -j1 V=s
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h ./ --max-depth=1
+          du -h /mnt/openwrt/ --max-depth=1 || true
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p ./artifact/firmware
+          mkdir -p ./artifact/package
+          mkdir -p ./artifact/buildinfo
+          rm -rf $(find ./bin/targets/ -type d -name "packages")
+          cp -rf $(find ./bin/targets/ -type f) ./artifact/firmware/
+          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
+          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+
+      - name: Set current date as env variable   
+        run: |     
+          echo "FILE_DATE=$(date +"%m%d_%H%M")" >> $GITHUB_ENV
+
+      - name: Deliver firmware
+        uses: actions/upload-artifact@main 
+        with:
+          name: ${{ inputs.model }}_${{ env.FILE_DATE }}
+          path: ./bin/targets/
+        
+      - name: Upload release asset
+        # if: github.event == 'release'
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./artifact/firmware/*
+          tag: ${{ inputs.model }}_${{ env.FILE_DATE }}
+          file_glob: true
+          
